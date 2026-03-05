@@ -624,8 +624,9 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       return webMessageInfo[0].message;
-    } catch {
-      return { conversation: '' };
+    } catch (err) {
+      this.logger.warn(`[${this.instance.name}] getMessage failed: ${err?.message || 'unknown error'}`);
+      return undefined;
     }
   }
 
@@ -2025,7 +2026,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
+              await this.connectionUpdate(events['connection.update']);
             }
 
             if (events['creds.update']) {
