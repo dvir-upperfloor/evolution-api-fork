@@ -256,6 +256,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
 
+  // Bad MAC / session corruption tracking
+  private badMacCounter: number = 0;
+  private badMacLastReset: number = Date.now();
+  private readonly BAD_MAC_THRESHOLD = 5;
+  private readonly BAD_MAC_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
   public stateConnection: wa.StateConnection = { state: 'close' };
 
   public phoneNumber: string;
@@ -651,6 +657,7 @@ export class BaileysStartupService extends ChannelStartupService {
       markOnlineOnConnect: this.localSettings.alwaysOnline,
       retryRequestDelayMs: 350,
       maxMsgRetryCount: 4,
+      enableAutoSessionRecreation: true,
       fireInitQueries: true,
       connectTimeoutMs: 30_000,
       keepAliveIntervalMs: 30_000,
@@ -1099,9 +1106,39 @@ export class BaileysStartupService extends ChannelStartupService {
               ].some((err) => param?.includes?.(err)),
             )
           ) {
-            this.logger.warn(`Message ignored with messageStubParameters: ${JSON.stringify(received, null, 2)}`);
+            // Reset counter if outside the time window
+            if (Date.now() - this.badMacLastReset > this.BAD_MAC_WINDOW_MS) {
+              this.badMacCounter = 0;
+              this.badMacLastReset = Date.now();
+            }
+            this.badMacCounter++;
+            this.logger.warn(
+              `[${this.instance.name}] Bad MAC / decrypt error #${this.badMacCounter}/${this.BAD_MAC_THRESHOLD} in ${this.BAD_MAC_WINDOW_MS / 1000}s window — messageStubParameters: ${JSON.stringify(received.messageStubParameters)}`
+            );
+
+            if (this.badMacCounter >= this.BAD_MAC_THRESHOLD) {
+              this.logger.error(
+                `[${this.instance.name}] Too many Bad MAC errors (${this.badMacCounter} in ${this.BAD_MAC_WINDOW_MS / 1000}s). Forcing soft reconnect to recover from ghost connection.`
+              );
+              this.badMacCounter = 0;
+              this.badMacLastReset = Date.now();
+
+              // Step 1: Try soft reconnect first (close WebSocket, Baileys will auto-reconnect from existing session)
+              try {
+                this.client?.ws?.close();
+                this.logger.info(`[${this.instance.name}] WebSocket closed for soft reconnect after Bad MAC threshold`);
+              } catch (err) {
+                // Step 2: If soft reconnect fails, force full reconnect
+                this.logger.error(`[${this.instance.name}] Soft reconnect failed, forcing full reconnect: ${err.message}`);
+                this.connectToWhatsapp(this.phoneNumber).catch((reconnectErr) => {
+                  this.logger.error(`[${this.instance.name}] Full reconnect also failed: ${reconnectErr.message}`);
+                });
+              }
+            }
+
             continue;
           }
+          this.badMacCounter = 0;
           if (received.message?.conversation || received.message?.extendedTextMessage?.text) {
             const text = received.message?.conversation || received.message?.extendedTextMessage?.text;
 

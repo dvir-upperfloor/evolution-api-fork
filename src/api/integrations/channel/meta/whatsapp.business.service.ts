@@ -664,6 +664,25 @@ export class BusinessStartupService extends ChannelStartupService {
           // await this.client.readMessages([received.key]);
         }
 
+        // Extract CTWA (Click-to-WhatsApp) referral data from Meta webhook and map to contextInfo.externalAdReply
+        if (message.referral) {
+          const referral = message.referral;
+          const externalAdReply: any = {
+            ...(referral.source_url && { sourceUrl: referral.source_url }),
+            ...(referral.source_id && { sourceId: referral.source_id }),
+            ...(referral.source_type && { sourceType: referral.source_type }),
+            ...(referral.headline && { title: referral.headline }),
+            ...(referral.body && { body: referral.body }),
+            ...(referral.media_type && { mediaType: referral.media_type }),
+            ...(referral.ctwa_clid && { ctwaClid: referral.ctwa_clid }),
+            showAdAttribution: true,
+          };
+          messageRaw.contextInfo = {
+            ...(messageRaw.contextInfo || {}),
+            externalAdReply,
+          };
+        }
+
         this.logger.log(messageRaw);
 
         sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
