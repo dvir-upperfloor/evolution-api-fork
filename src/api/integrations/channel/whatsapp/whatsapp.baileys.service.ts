@@ -69,6 +69,7 @@ import {
   configService,
   ConfigSessionPhone,
   Database,
+  HttpServer,
   Log,
   Openai,
   ProviderSession,
@@ -104,6 +105,7 @@ import makeWASocket, {
   DisconnectReason,
   downloadContentFromMessage,
   downloadMediaMessage,
+  fetchLatestBaileysVersion,
   generateWAMessageFromContent,
   getAggregateVotesInPollMessage,
   GetCatalogOptions,
@@ -130,6 +132,7 @@ import makeWASocket, {
   WAMessageKey,
   WAPresence,
   WASocket,
+  WAVersion,
 } from 'baileys';
 import { Label } from 'baileys/lib/Types/Label';
 import { LabelAssociation } from 'baileys/lib/Types/LabelAssociation';
@@ -246,8 +249,8 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private authStateProvider: AuthStateProvider;
-  private readonly msgRetryCounterCache: CacheStore = new NodeCache();
-  private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
+  private readonly msgRetryCounterCache: CacheStore = new NodeCache({ stdTTL: 300, maxKeys: 1000, useClones: false });
+  private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300, maxKeys: 5000, useClones: false });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
@@ -261,6 +264,17 @@ export class BaileysStartupService extends ChannelStartupService {
   private badMacLastReset: number = Date.now();
   private readonly BAD_MAC_THRESHOLD = 5;
   private readonly BAD_MAC_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
+  // Reconnect backoff tracking
+  private reconnectAttempts: number = 0;
+  private readonly MAX_RECONNECT_ATTEMPTS = 10;
+  private readonly INITIAL_RECONNECT_DELAY_MS = 3000; // 3 seconds
+  private readonly MAX_RECONNECT_DELAY_MS = 120000; // 2 minutes
+
+  // WhatsApp version cache (shared across all instances in this process)
+  private static cachedWaVersion: WAVersion | null = null;
+  private static versionFetchedAt: number = 0;
+  private static readonly VERSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
   public stateConnection: wa.StateConnection = { state: 'close' };
 
@@ -335,6 +349,44 @@ export class BaileysStartupService extends ChannelStartupService {
       base64: this.instance.qrcode?.base64,
       count: this.instance.qrcode?.count,
     };
+  }
+
+  private getReconnectDelay(): number {
+    const delay = Math.min(
+      this.INITIAL_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts),
+      this.MAX_RECONNECT_DELAY_MS,
+    );
+    const jitter = delay * 0.2 * (Math.random() * 2 - 1);
+    return Math.floor(delay + jitter);
+  }
+
+  private async sendDisconnectAlert(reason: string, statusCode: number): Promise<void> {
+    try {
+      const MONITOR_WEBHOOK_URL = 'https://n8n.upperfloor.ai/webhook/monitor/evo-instances';
+
+      const payload = {
+        event: 'instance.disconnected',
+        instance: this.instance.name,
+        data: {
+          instance: this.instance.name,
+          reason,
+          statusCode,
+          requiresQrRescan: true,
+          disconnectedAt: new Date().toISOString(),
+          phoneNumber: this.phoneNumber || null,
+        },
+        server_url: this.configService.get<HttpServer>('SERVER').URL,
+      };
+
+      this.logger.error(
+        `[${this.instance.name}] Instance permanently disconnected (status: ${statusCode}, reason: ${reason}). QR rescan required.`,
+      );
+      await axios.post(MONITOR_WEBHOOK_URL, payload, { timeout: 10000 }).catch((err) => {
+        this.logger.error(`[${this.instance.name}] Failed to send disconnect alert webhook: ${err.message}`);
+      });
+    } catch (err) {
+      this.logger.error(`[${this.instance.name}] Error in sendDisconnectAlert: ${err.message}`);
+    }
   }
 
   private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
@@ -434,6 +486,21 @@ export class BaileysStartupService extends ChannelStartupService {
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
       if (shouldReconnect) {
+        if (this.reconnectAttempts >= this.MAX_RECONNECT_ATTEMPTS) {
+          this.logger.error(
+            `[${this.instance.name}] Max reconnect attempts (${this.MAX_RECONNECT_ATTEMPTS}) reached. Giving up. Status code: ${statusCode}`,
+          );
+          this.reconnectAttempts = 0;
+          await this.sendDisconnectAlert('Max reconnect attempts exhausted', statusCode);
+          return;
+        }
+        const reconnectDelay = this.getReconnectDelay();
+        this.reconnectAttempts++;
+        this.logger.warn(
+          `[${this.instance.name}] Reconnecting in ${reconnectDelay}ms (attempt ${this.reconnectAttempts}/${this.MAX_RECONNECT_ATTEMPTS}, status: ${statusCode})`,
+        );
+        const actualDelay = statusCode === 440 ? Math.max(reconnectDelay, 10000) : reconnectDelay;
+        await new Promise((resolve) => setTimeout(resolve, actualDelay));
         await this.connectToWhatsapp(this.phoneNumber);
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
@@ -454,6 +521,8 @@ export class BaileysStartupService extends ChannelStartupService {
           },
         });
 
+        await this.sendDisconnectAlert('Non-recoverable disconnect', statusCode);
+
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
           this.chatwootService.eventWhatsapp(
             Events.STATUS_INSTANCE,
@@ -472,6 +541,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'open') {
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
+      this.reconnectAttempts = 0;
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
         this.instance.profilePictureUrl = profilePic.profilePictureUrl;
@@ -597,11 +667,27 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.info(`Browser: ${browser}`);
     }
 
-    const baileysVersion = await fetchLatestWaWebVersion({});
-    const version = baileysVersion.version;
-    const log = `Baileys version: ${version.join('.')}`;
-
-    this.logger.info(log);
+    let version: WAVersion;
+    const now = Date.now();
+    if (
+      BaileysStartupService.cachedWaVersion &&
+      now - BaileysStartupService.versionFetchedAt < BaileysStartupService.VERSION_CACHE_TTL_MS
+    ) {
+      version = BaileysStartupService.cachedWaVersion;
+      this.logger.info(`[${this.instance.name}] Using cached WhatsApp version: ${version.join('.')}`);
+    } else {
+      try {
+        const baileysVersion = await fetchLatestWaWebVersion({});
+        version = baileysVersion.version;
+      } catch (error) {
+        const fallback = await fetchLatestBaileysVersion();
+        version = fallback.version;
+        this.logger.warn(`[${this.instance.name}] Using fallback Baileys version: ${version.join('.')}`);
+      }
+      BaileysStartupService.cachedWaVersion = version;
+      BaileysStartupService.versionFetchedAt = now;
+      this.logger.info(`[${this.instance.name}] Fetched and cached WhatsApp version: ${version.join('.')}`);
+    }
 
     this.logger.info(`Group Ignore: ${this.localSettings.groupsIgnore}`);
 
@@ -1113,12 +1199,12 @@ export class BaileysStartupService extends ChannelStartupService {
             }
             this.badMacCounter++;
             this.logger.warn(
-              `[${this.instance.name}] Bad MAC / decrypt error #${this.badMacCounter}/${this.BAD_MAC_THRESHOLD} in ${this.BAD_MAC_WINDOW_MS / 1000}s window — messageStubParameters: ${JSON.stringify(received.messageStubParameters)}`
+              `[${this.instance.name}] Bad MAC / decrypt error #${this.badMacCounter}/${this.BAD_MAC_THRESHOLD} in ${this.BAD_MAC_WINDOW_MS / 1000}s window — messageStubParameters: ${JSON.stringify(received.messageStubParameters)}`,
             );
 
             if (this.badMacCounter >= this.BAD_MAC_THRESHOLD) {
               this.logger.error(
-                `[${this.instance.name}] Too many Bad MAC errors (${this.badMacCounter} in ${this.BAD_MAC_WINDOW_MS / 1000}s). Forcing soft reconnect to recover from ghost connection.`
+                `[${this.instance.name}] Too many Bad MAC errors (${this.badMacCounter} in ${this.BAD_MAC_WINDOW_MS / 1000}s). Forcing soft reconnect to recover from ghost connection.`,
               );
               this.badMacCounter = 0;
               this.badMacLastReset = Date.now();
@@ -1129,7 +1215,9 @@ export class BaileysStartupService extends ChannelStartupService {
                 this.logger.info(`[${this.instance.name}] WebSocket closed for soft reconnect after Bad MAC threshold`);
               } catch (err) {
                 // Step 2: If soft reconnect fails, force full reconnect
-                this.logger.error(`[${this.instance.name}] Soft reconnect failed, forcing full reconnect: ${err.message}`);
+                this.logger.error(
+                  `[${this.instance.name}] Soft reconnect failed, forcing full reconnect: ${err.message}`,
+                );
                 this.connectToWhatsapp(this.phoneNumber).catch((reconnectErr) => {
                   this.logger.error(`[${this.instance.name}] Full reconnect also failed: ${reconnectErr.message}`);
                 });
