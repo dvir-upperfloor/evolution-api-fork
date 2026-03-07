@@ -391,7 +391,7 @@ export class BusinessStartupService extends ChannelStartupService {
 
       if (received.messages) {
         const message = received.messages[0]; // Añadir esta línea para definir message
-        this.logger.warn(`[CTWA-DEBUG] Raw Meta message from ${message.from}: type=${message.type}, keys=[${Object.keys(message).join(',')}], referral=${JSON.stringify(message.referral || 'NONE')}, context=${JSON.stringify(message.context || 'NONE')}`);
+        this.logger.error(`[CTWA-DEBUG] Raw Meta message from ${message.from}: type=${message.type}, keys=[${Object.keys(message).join(',')}], referral=${JSON.stringify(message.referral || 'NONE')}, context=${JSON.stringify(message.context || 'NONE')}`);
 
         const key = {
           id: message.id,
@@ -918,7 +918,7 @@ export class BusinessStartupService extends ChannelStartupService {
       // Registro para depuración
       this.logger.log('Contenido recibido en eventHandler:');
       this.logger.log(JSON.stringify(content, null, 2));
-      this.logger.warn(`[CTWA-DEBUG-RAW] Full Meta payload messages[0] keys: ${JSON.stringify(Object.keys(content?.messages?.[0] || {}))}, has referral: ${!!content?.messages?.[0]?.referral}, has context: ${!!content?.messages?.[0]?.context}`);
+      this.logger.error(`[CTWA-DEBUG-RAW] Full Meta payload messages[0] keys: ${JSON.stringify(Object.keys(content?.messages?.[0] || {}))}, has referral: ${!!content?.messages?.[0]?.referral}, has context: ${!!content?.messages?.[0]?.context}`);
 
       const database = this.configService.get<Database>('DATABASE');
       const settings = await this.findSettings();
