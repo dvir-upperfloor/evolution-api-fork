@@ -842,6 +842,45 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  public async restart(): Promise<void> {
+    this.logger.info(`[${this.instance.name}] Restarting Baileys connection`);
+
+    // Suppress all event processing on the old socket so the connectionUpdate
+    // 'close' event doesn't trigger the auto-reconnect loop while we reinitialize.
+    // createClient() resets this flag to false before calling makeWASocket().
+    this.endSession = true;
+
+    // Tear down the RxJS-backed message queue before the socket disappears.
+    this.messageProcessor.onDestroy();
+
+    // Force-close the WebSocket. terminate() skips the graceful close handshake,
+    // which is essential for ghost connections where the remote end is unresponsive
+    // and close() would block waiting for a reply that never comes.
+    try {
+      if (typeof (this.client?.ws as any)?.terminate === 'function') {
+        (this.client.ws as any).terminate();
+      } else {
+        this.client?.ws?.close();
+      }
+    } catch {
+      // Socket may already be gone — safe to ignore.
+    }
+
+    // Give the OS a moment to release the underlying TCP handle before we
+    // open a new socket on the same auth state.
+    await new Promise<void>((r) => setTimeout(r, 500));
+
+    // Reset all backoff and error-rate counters so the fresh socket
+    // starts with a clean slate (no inherited penalty from the ghost session).
+    this.reconnectAttempts = 0;
+    this.badMacCounter = 0;
+    this.badMacLastReset = Date.now();
+
+    // Reinitialize from stored auth — no QR scan required.
+    // connectToWhatsapp → createClient → sets endSession = false → makeWASocket.
+    await this.connectToWhatsapp(this.phoneNumber);
+  }
+
   private readonly chatHandle = {
     'chats.upsert': async (chats: Chat[]) => {
       const existingChatIds = await this.prismaRepository.chat.findMany({

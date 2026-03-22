@@ -352,9 +352,6 @@ export class InstanceController {
         throw new BadRequestException('The "' + instanceName + '" instance does not exist');
       }
 
-      if (state === 'close') {
-        throw new BadRequestException('The "' + instanceName + '" instance is not connected');
-      }
       this.logger.info(`Restarting instance: ${instanceName}`);
 
       if (typeof instance.restart === 'function') {
