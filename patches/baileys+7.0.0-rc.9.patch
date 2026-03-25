@@ -1,0 +1,270 @@
+diff --git a/node_modules/baileys/lib/Defaults/index.js b/node_modules/baileys/lib/Defaults/index.js
+index 7651b27..9ef0ca1 100644
+--- a/node_modules/baileys/lib/Defaults/index.js
++++ b/node_modules/baileys/lib/Defaults/index.js
+@@ -15,6 +15,10 @@ export const WA_ADV_DEVICE_SIG_PREFIX = Buffer.from([6, 1]);
+ export const WA_ADV_HOSTED_ACCOUNT_SIG_PREFIX = Buffer.from([6, 5]);
+ export const WA_ADV_HOSTED_DEVICE_SIG_PREFIX = Buffer.from([6, 6]);
+ export const WA_DEFAULT_EPHEMERAL = 7 * 24 * 60 * 60;
++/** Status messages older than 24 hours are considered expired */
++export const STATUS_EXPIRY_SECONDS = 24 * 60 * 60;
++/** WA Web enforces a 14-day maximum age for placeholder resend requests */
++export const PLACEHOLDER_MAX_AGE_SECONDS = 14 * 24 * 60 * 60;
+ export const NOISE_MODE = 'Noise_XX_25519_AESGCM_SHA256\0\0\0\0';
+ export const DICT_VERSION = 3;
+ export const KEY_BUNDLE_TYPE = Buffer.from([5]);
+diff --git a/node_modules/baileys/lib/Socket/messages-recv.js b/node_modules/baileys/lib/Socket/messages-recv.js
+index f2e2e10..9b53b48 100644
+--- a/node_modules/baileys/lib/Socket/messages-recv.js
++++ b/node_modules/baileys/lib/Socket/messages-recv.js
+@@ -3,7 +3,7 @@ import { Boom } from '@hapi/boom';
+ import { randomBytes } from 'crypto';
+ import Long from 'long';
+ import { proto } from '../../WAProto/index.js';
+-import { DEFAULT_CACHE_TTLS, KEY_BUNDLE_TYPE, MIN_PREKEY_COUNT } from '../Defaults/index.js';
++import { DEFAULT_CACHE_TTLS, KEY_BUNDLE_TYPE, MIN_PREKEY_COUNT, PLACEHOLDER_MAX_AGE_SECONDS, STATUS_EXPIRY_SECONDS } from '../Defaults/index.js';
+ import { WAMessageStatus, WAMessageStubType } from '../Types/index.js';
+ import { aesDecryptCTR, aesEncryptGCM, cleanMessage, Curve, decodeMediaRetryNode, decodeMessageNode, decryptMessageNode, delay, derivePairingCodeKey, encodeBigEndian, encodeSignedDeviceIdentity, extractAddressingContext, getCallStatusFromNode, getHistoryMsg, getNextPreKeys, getStatusFromReceiptType, hkdf, MISSING_KEYS_ERROR_TEXT, NACK_REASONS, NO_MESSAGE_FOUND_ERROR_TEXT, unixTimestampSeconds, xmppPreKey, xmppSignedPreKey } from '../Utils/index.js';
+ import { makeMutex } from '../Utils/make-mutex.js';
+@@ -50,7 +50,7 @@ export const makeMessagesRecvSocket = (config) => {
+         };
+         return sendPeerDataOperationMessage(pdoMessage);
+     };
+-    const requestPlaceholderResend = async (messageKey) => {
++    const requestPlaceholderResend = async (messageKey, msgData) => {
+         if (!authState.creds.me?.id) {
+             throw new Boom('Not authenticated');
+         }
+@@ -59,7 +59,9 @@ export const makeMessagesRecvSocket = (config) => {
+             return;
+         }
+         else {
+-            await placeholderResendCache.set(messageKey?.id, true);
++            // Store original message metadata so the PDO response handler can
++            // preserve pushName, participant, etc. that the phone may omit.
++            await placeholderResendCache.set(messageKey?.id, msgData || true);
+         }
+         await delay(5000);
+         if (!placeholderResendCache.get(messageKey?.id)) {
+@@ -988,52 +990,114 @@ export const makeMessagesRecvSocket = (config) => {
+                 await decrypt();
+                 // message failed to decrypt
+                 if (msg.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT && msg.category !== 'peer') {
+-                    if (msg?.messageStubParameters?.[0] === MISSING_KEYS_ERROR_TEXT ||
+-                        msg.messageStubParameters?.[0] === NO_MESSAGE_FOUND_ERROR_TEXT) {
++                    if (msg.messageStubParameters?.[0] === NO_MESSAGE_FOUND_ERROR_TEXT) {
++                        // CTWA ad message — Meta does not encrypt for companion devices.
++                        // Check the <unavailable> node type to filter cases that should not
++                        // trigger a placeholder resend (bots, hosted fanouts, view-once).
++                        const unavailableNode = getBinaryNodeChild(node, 'unavailable');
++                        const unavailableType = unavailableNode?.attrs?.type;
++                        if (unavailableType === 'bot_unavailable_fanout' ||
++                            unavailableType === 'hosted_unavailable_fanout' ||
++                            unavailableType === 'view_once_unavailable_fanout') {
++                            logger.debug({ msgId: msg.key.id, unavailableType }, 'skipping placeholder resend for excluded unavailable type');
++                            return sendMessageAck(node);
++                        }
++                        const messageAge = unixTimestampSeconds() - toNumber(msg.messageTimestamp);
++                        if (messageAge > PLACEHOLDER_MAX_AGE_SECONDS) {
++                            logger.debug({ msgId: msg.key.id, messageAge }, 'skipping placeholder resend for old message');
++                            return sendMessageAck(node);
++                        }
++                        // Request the real message content from the phone via PDO.
++                        // Cache the original metadata so the response handler can merge
++                        // pushName, participant, verifiedBizName back onto the decoded message.
++                        const cleanKey = {
++                            remoteJid: msg.key.remoteJid,
++                            fromMe: msg.key.fromMe,
++                            id: msg.key.id,
++                            participant: msg.key.participant
++                        };
++                        const msgData = {
++                            key: msg.key,
++                            messageTimestamp: msg.messageTimestamp,
++                            pushName: msg.pushName,
++                            participant: msg.participant,
++                            verifiedBizName: msg.verifiedBizName
++                        };
++                        requestPlaceholderResend(cleanKey, msgData)
++                            .then(requestId => {
++                                if (requestId && requestId !== 'RESOLVED') {
++                                    logger.debug({ msgId: msg.key.id, requestId }, 'requested placeholder resend for unavailable message');
++                                    ev.emit('messages.update', [
++                                        {
++                                            key: msg.key,
++                                            update: { messageStubParameters: [NO_MESSAGE_FOUND_ERROR_TEXT, requestId] }
++                                        }
++                                    ]);
++                                }
++                            })
++                            .catch(err => {
++                                logger.warn({ err, msgId: msg.key.id }, 'failed to request placeholder resend for unavailable message');
++                            });
++                        await sendMessageAck(node);
++                        // Do not return — fall through to cleanMessage + upsertMessage so
++                        // the CIPHERTEXT stub is emitted as a placeholder while we wait.
++                    }
++                    else if (msg?.messageStubParameters?.[0] === MISSING_KEYS_ERROR_TEXT) {
+                         return sendMessageAck(node);
+                     }
+-                    const errorMessage = msg?.messageStubParameters?.[0] || '';
+-                    const isPreKeyError = errorMessage.includes('PreKey');
+-                    logger.debug(`[handleMessage] Attempting retry request for failed decryption`);
+-                    // Handle both pre-key and normal retries in single mutex
+-                    await retryMutex.mutex(async () => {
+-                        try {
+-                            if (!ws.isOpen) {
+-                                logger.debug({ node }, 'Connection closed, skipping retry');
+-                                return;
+-                            }
+-                            // Handle pre-key errors with upload and delay
+-                            if (isPreKeyError) {
+-                                logger.info({ error: errorMessage }, 'PreKey error detected, uploading and retrying');
+-                                try {
+-                                    logger.debug('Uploading pre-keys for error recovery');
+-                                    await uploadPreKeys(5);
+-                                    logger.debug('Waiting for server to process new pre-keys');
+-                                    await delay(1000);
+-                                }
+-                                catch (uploadErr) {
+-                                    logger.error({ uploadErr }, 'Pre-key upload failed, proceeding with retry anyway');
+-                                }
+-                            }
+-                            const encNode = getBinaryNodeChild(node, 'enc');
+-                            await sendRetryRequest(node, !encNode);
+-                            if (retryRequestDelayMs) {
+-                                await delay(retryRequestDelayMs);
++                    else {
++                        // Normal decryption failure — use the retry / PreKey mechanism.
++                        const errorMessage = msg?.messageStubParameters?.[0] || '';
++                        const isPreKeyError = errorMessage.includes('PreKey');
++                        logger.debug(`[handleMessage] Attempting retry request for failed decryption`);
++                        // Skip retry for expired status messages (>24h old)
++                        if (isJidStatusBroadcast(msg.key.remoteJid)) {
++                            const messageAge = unixTimestampSeconds() - toNumber(msg.messageTimestamp);
++                            if (messageAge > STATUS_EXPIRY_SECONDS) {
++                                logger.debug({ msgId: msg.key.id, messageAge, remoteJid: msg.key.remoteJid }, 'skipping retry for expired status message');
++                                return sendMessageAck(node);
+                             }
+                         }
+-                        catch (err) {
+-                            logger.error({ err, isPreKeyError }, 'Failed to handle retry, attempting basic retry');
+-                            // Still attempt retry even if pre-key upload failed
++                        // Handle both pre-key and normal retries in single mutex
++                        await retryMutex.mutex(async () => {
+                             try {
++                                if (!ws.isOpen) {
++                                    logger.debug({ node }, 'Connection closed, skipping retry');
++                                    return;
++                                }
++                                // Handle pre-key errors with upload and delay
++                                if (isPreKeyError) {
++                                    logger.info({ error: errorMessage }, 'PreKey error detected, uploading and retrying');
++                                    try {
++                                        logger.debug('Uploading pre-keys for error recovery');
++                                        await uploadPreKeys(5);
++                                        logger.debug('Waiting for server to process new pre-keys');
++                                        await delay(1000);
++                                    }
++                                    catch (uploadErr) {
++                                        logger.error({ uploadErr }, 'Pre-key upload failed, proceeding with retry anyway');
++                                    }
++                                }
+                                 const encNode = getBinaryNodeChild(node, 'enc');
+                                 await sendRetryRequest(node, !encNode);
++                                if (retryRequestDelayMs) {
++                                    await delay(retryRequestDelayMs);
++                                }
+                             }
+-                            catch (retryErr) {
+-                                logger.error({ retryErr }, 'Failed to send retry after error handling');
++                            catch (err) {
++                                logger.error({ err, isPreKeyError }, 'Failed to handle retry, attempting basic retry');
++                                // Still attempt retry even if pre-key upload failed
++                                try {
++                                    const encNode = getBinaryNodeChild(node, 'enc');
++                                    await sendRetryRequest(node, !encNode);
++                                }
++                                catch (retryErr) {
++                                    logger.error({ retryErr }, 'Failed to send retry after error handling');
++                                }
+                             }
+-                        }
+-                        await sendMessageAck(node, NACK_REASONS.UnhandledError);
+-                    });
++                            await sendMessageAck(node, NACK_REASONS.UnhandledError);
++                        });
++                    }
+                 }
+                 else {
+                     const isNewsletter = isJidNewsletter(msg.key.remoteJid);
+diff --git a/node_modules/baileys/lib/Utils/process-message.js b/node_modules/baileys/lib/Utils/process-message.js
+index 7927483..a84f5bd 100644
+--- a/node_modules/baileys/lib/Utils/process-message.js
++++ b/node_modules/baileys/lib/Utils/process-message.js
+@@ -215,23 +215,52 @@ const processMessage = async (message, { shouldProcessHistoryMsg, placeholderRes
+             case proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE:
+                 const response = protocolMsg.peerDataOperationRequestResponseMessage;
+                 if (response) {
+-                    await placeholderResendCache?.del(response.stanzaId);
+                     // TODO: IMPLEMENT HISTORY SYNC ETC (sticker uploads etc.).
+-                    const { peerDataOperationResult } = response;
++                    const peerDataOperationResult = response.peerDataOperationResult || [];
+                     for (const result of peerDataOperationResult) {
+-                        const { placeholderMessageResendResponse: retryResponse } = result;
++                        const retryResponse = result?.placeholderMessageResendResponse;
++                        // Bug E fix: guard against missing bytes before decoding
+                         //eslint-disable-next-line max-depth
+-                        if (retryResponse) {
++                        if (!retryResponse?.webMessageInfoBytes) {
++                            continue;
++                        }
++                        // Bug D fix: wrap decode + emit in try/catch
++                        //eslint-disable-next-line max-depth
++                        try {
+                             const webMessageInfo = proto.WebMessageInfo.decode(retryResponse.webMessageInfoBytes);
+-                            // wait till another upsert event is available, don't want it to be part of the PDO response message
+-                            // TODO: parse through proper message handling utilities (to add relevant key fields)
+-                            setTimeout(() => {
+-                                ev.emit('messages.upsert', {
+-                                    messages: [webMessageInfo],
+-                                    type: 'notify',
+-                                    requestId: response.stanzaId
+-                                });
+-                            }, 500);
++                            const msgId = webMessageInfo.key?.id;
++                            // Bug A fix: delete by original message ID, not stanzaId.
++                            // Bug B fix: retrieve cached metadata to merge onto the response
++                            // (preserves pushName, participant, verifiedBizName that the phone omits).
++                            const cachedData = msgId ? await placeholderResendCache?.get(msgId) : undefined;
++                            //eslint-disable-next-line max-depth
++                            if (msgId) {
++                                await placeholderResendCache?.del(msgId);
++                            }
++                            let finalMsg;
++                            //eslint-disable-next-line max-depth
++                            if (cachedData && typeof cachedData === 'object') {
++                                cachedData.message = webMessageInfo.message;
++                                //eslint-disable-next-line max-depth
++                                if (webMessageInfo.messageTimestamp) {
++                                    cachedData.messageTimestamp = webMessageInfo.messageTimestamp;
++                                }
++                                finalMsg = cachedData;
++                            }
++                            else {
++                                finalMsg = webMessageInfo;
++                            }
++                            logger?.debug({ msgId, requestId: response.stanzaId }, 'received placeholder resend');
++                            // Bug C fix: emit synchronously — no setTimeout needed as
++                            // Evolution API processes messages.upsert via RxJS concatMap.
++                            ev.emit('messages.upsert', {
++                                messages: [finalMsg],
++                                type: 'notify',
++                                requestId: response.stanzaId
++                            });
++                        }
++                        catch (err) {
++                            logger?.warn({ err, stanzaId: response.stanzaId }, 'failed to decode placeholder resend response');
+                         }
+                     }
+                 }
