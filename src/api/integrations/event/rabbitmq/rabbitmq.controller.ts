@@ -190,11 +190,23 @@ export class RabbitmqController extends EventController implements EventControll
 
   private async ensureConnection(): Promise<boolean> {
     if (!this.amqpChannel) {
-      this.logger.warn('AMQP channel is not available, attempting to reconnect...');
+      this.logger.warn('AMQP channel not available — waiting up to 5s for reconnect...');
       if (!this.isReconnecting) {
         this.scheduleReconnect();
       }
-      return false;
+
+      // Poll until the background reconnect succeeds or the deadline passes.
+      // scheduleReconnect() is setTimeout-based (async/non-blocking), so we
+      // must wait rather than returning immediately to avoid silent message drops.
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline && !this.amqpChannel) {
+        await new Promise((r) => setTimeout(r, 200));
+      }
+
+      if (!this.amqpChannel) {
+        this.logger.error('AMQP channel still unavailable after 5s — message dropped');
+        return false;
+      }
     }
     return true;
   }

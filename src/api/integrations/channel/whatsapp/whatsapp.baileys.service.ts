@@ -56,7 +56,7 @@ import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoo
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository, Query } from '@api/repository/repository.service';
-import { chatbotController, waMonitor } from '@api/server.module';
+import { chatbotController, eventManager, waMonitor } from '@api/server.module';
 import { CacheService } from '@api/services/cache.service';
 import { ChannelStartupService } from '@api/services/channel.service';
 import { Events, MessageSubtype, TypeMediaMessage, wa } from '@api/types/wa.types';
@@ -875,6 +875,19 @@ export class BaileysStartupService extends ChannelStartupService {
     this.reconnectAttempts = 0;
     this.badMacCounter = 0;
     this.badMacLastReset = Date.now();
+
+    // If the RabbitMQ channel died during the ghost session, reinitialize it
+    // before the new Baileys socket starts emitting events. Without this,
+    // every sendDataWebhook() call hits a dead channel and is silently dropped.
+    if (!eventManager.rabbitmq.amqpChannel) {
+      this.logger.warn(`[${this.instance.name}] RabbitMQ channel dead — reinitializing before reconnect`);
+      try {
+        await eventManager.rabbitmq.init();
+      } catch (err: any) {
+        this.logger.error(`[${this.instance.name}] RabbitMQ reinit failed: ${err?.message}`);
+        // Non-fatal: proceed with restart; ensureConnection() will retry on each emit.
+      }
+    }
 
     // Reinitialize from stored auth — no QR scan required.
     // connectToWhatsapp → createClient → sets endSession = false → makeWASocket.
