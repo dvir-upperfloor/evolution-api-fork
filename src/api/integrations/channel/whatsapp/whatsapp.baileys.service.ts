@@ -889,6 +889,12 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     }
 
+    // Sever the old Promise chain. If a handler on the ghost socket hung
+    // (e.g. sendMessage on a dead WebSocket), the chain is permanently stuck
+    // and every new .then() appended by eventHandler() would queue behind it
+    // forever. Starting fresh lets the new socket's events process immediately.
+    this.eventProcessingQueue = Promise.resolve();
+
     // Reinitialize from stored auth — no QR scan required.
     // connectToWhatsapp → createClient → sets endSession = false → makeWASocket.
     await this.connectToWhatsapp(this.phoneNumber);
