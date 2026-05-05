@@ -133,7 +133,11 @@ export class BusinessStartupService extends ChannelStartupService {
 
       this.eventHandler(content);
 
-      this.phoneNumber = createJid(content.messages ? content.messages[0].from : content.statuses[0]?.recipient_id);
+      this.phoneNumber = content.messages
+        ? createJid(content.messages[0].from)
+        : content.message_echoes
+          ? createJid(content.message_echoes[0].from)
+          : createJid(content.statuses[0]?.recipient_id);
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
@@ -913,6 +917,106 @@ export class BusinessStartupService extends ChannelStartupService {
     return message;
   }
 
+  private async messageHandleEcho(content: any, database: Database, settings: any) {
+    try {
+      // Normalize message_echoes to messages so existing parsers work unchanged
+      const normalizedContent = { ...content, messages: content.message_echoes };
+      const message = normalizedContent.messages[0];
+
+      if (!message) return;
+
+      const key = {
+        id: message.id,
+        remoteJid: createJid(message.to),
+        fromMe: true as boolean,
+      };
+
+      let messageRaw: any;
+
+      if (message.type === 'sticker') {
+        messageRaw = {
+          key,
+          pushName: null,
+          message: { stickerMessage: message.sticker || {} },
+          messageType: 'stickerMessage',
+          messageTimestamp: parseInt(message.timestamp) as number,
+          source: 'unknown',
+          instanceId: this.instanceId,
+        };
+      } else if (this.isMediaMessage(message)) {
+        const messageContent =
+          message.type === 'audio' ? this.messageAudioJson(normalizedContent) : this.messageMediaJson(normalizedContent);
+
+        messageRaw = {
+          key,
+          pushName: null,
+          message: messageContent,
+          contextInfo: messageContent?.contextInfo,
+          messageType: this.renderMessageType(message.type),
+          messageTimestamp: parseInt(message.timestamp) as number,
+          source: 'unknown',
+          instanceId: this.instanceId,
+        };
+      } else if (message.location) {
+        messageRaw = {
+          key,
+          pushName: null,
+          message: { ...this.messageLocationJson(normalizedContent) },
+          contextInfo: this.messageLocationJson(normalizedContent)?.contextInfo,
+          messageType: 'locationMessage',
+          messageTimestamp: parseInt(message.timestamp) as number,
+          source: 'unknown',
+          instanceId: this.instanceId,
+        };
+      } else if (message.reaction) {
+        messageRaw = {
+          key,
+          pushName: null,
+          message: { ...this.messageReactionJson(normalizedContent) },
+          contextInfo: this.messageReactionJson(normalizedContent)?.contextInfo,
+          messageType: 'reactionMessage',
+          messageTimestamp: parseInt(message.timestamp) as number,
+          source: 'unknown',
+          instanceId: this.instanceId,
+        };
+      } else {
+        messageRaw = {
+          key,
+          pushName: null,
+          message: this.messageTextJson(normalizedContent),
+          contextInfo: this.messageTextJson(normalizedContent)?.contextInfo,
+          messageType: this.renderMessageType(message.type),
+          messageTimestamp: parseInt(message.timestamp) as number,
+          source: 'unknown',
+          instanceId: this.instanceId,
+        };
+      }
+
+      this.logger.log(messageRaw);
+
+      this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
+
+      if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+        const chatwootSentMessage = await this.chatwootService.eventWhatsapp(
+          Events.MESSAGES_UPSERT,
+          { instanceName: this.instance.name, instanceId: this.instanceId },
+          messageRaw,
+        );
+
+        if (chatwootSentMessage?.id) {
+          messageRaw.chatwootMessageId = chatwootSentMessage.id;
+          messageRaw.chatwootInboxId = chatwootSentMessage.id;
+          messageRaw.chatwootConversationId = chatwootSentMessage.id;
+        }
+      }
+
+      await this.prismaRepository.message.create({ data: messageRaw });
+    } catch (error) {
+      this.logger.error('Error in messageHandleEcho:');
+      this.logger.error(error);
+    }
+  }
+
   protected async eventHandler(content: any) {
     try {
       // Registro para depuración
@@ -950,6 +1054,8 @@ export class BusinessStartupService extends ChannelStartupService {
       } else if (content.statuses) {
         // Procesar actualizaciones de estado
         this.messageHandle(content, database, settings);
+      } else if (content.message_echoes && content.message_echoes.length > 0) {
+        this.messageHandleEcho(content, database, settings);
       } else {
         this.logger.warn('No se encontraron mensajes ni estados en el contenido recibido');
       }
