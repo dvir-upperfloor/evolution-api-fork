@@ -2059,7 +2059,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private eventHandler() {
     this.client.ev.process(async (events) => {
-      this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
+      this.eventProcessingQueue = this.eventProcessingQueue.then(() =>
+        Promise.race([
+          (async () => {
         try {
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
@@ -2198,7 +2200,17 @@ export class BaileysStartupService extends ChannelStartupService {
         } catch (error) {
           this.logger.error(error);
         }
-      });
+          })(),
+          new Promise<void>((resolve) =>
+            setTimeout(() => {
+              this.logger.error(
+                `[${this.instance.name}] eventHandler batch exceeded 90s — releasing queue`,
+              );
+              resolve();
+            }, 90_000),
+          ),
+        ]),
+      );
     });
   }
 
