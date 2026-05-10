@@ -4,7 +4,12 @@
       "Bash(npx tsc:*)",
       "Bash(gh api:*)",
       "Bash(done)",
-      "Bash(xargs grep:*)"
+      "Bash(xargs grep:*)",
+      "Bash(npm run *)",
+      "Bash(DATABASE_PROVIDER=postgresql npm run db:generate)",
+      "Bash(DATABASE_PROVIDER=postgresql npm run build)",
+      "Bash(DATABASE_PROVIDER=postgresql npx tsc --noEmit)",
+      "Bash(echo \"---EXIT---$?\")"
     ]
   }
 }

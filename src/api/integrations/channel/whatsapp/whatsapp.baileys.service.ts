@@ -747,6 +747,7 @@ export class BaileysStartupService extends ChannelStartupService {
       enableAutoSessionRecreation: true,
       fireInitQueries: true,
       connectTimeoutMs: 30_000,
+      defaultQueryTimeoutMs: 60_000,
       keepAliveIntervalMs: 30_000,
       qrTimeout: 45_000,
       emitOwnEvents: false,
@@ -2075,7 +2076,12 @@ export class BaileysStartupService extends ChannelStartupService {
                 if (call.from.endsWith('@lid')) {
                   call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
                 }
-                const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+                const msg = await Promise.race([
+                  this.client.sendMessage(call.from, { text: settings.msgCall }),
+                  new Promise<never>((_, reject) =>
+                    setTimeout(() => reject(new Error('sendMessage timeout (30s) — call auto-reply')), 30_000),
+                  ),
+                ]);
 
                 this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
               }
