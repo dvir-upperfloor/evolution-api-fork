@@ -1050,6 +1050,18 @@ export class BusinessStartupService extends ChannelStartupService {
           this.messageHandle(content, database, settings);
         } else {
           this.logger.warn(`Tipo de mensaje no reconocido: ${message.type}`);
+          this.logger.warn(`[UNSUPPORTED-RAW] instance=${this.instance.name} content=${JSON.stringify(content)}`);
+
+          axios
+            .post('https://n8n.upperfloor.ai/webhook/error-logs-workflow', {
+              type: 'unsupported_webhook',
+              instance: this.instance.name,
+              timestamp: new Date().toISOString(),
+              payload: content,
+            })
+            .catch((err) => {
+              this.logger.error(`[UNSUPPORTED-N8N-FAILED] ${err?.message}`);
+            });
         }
       } else if (content.statuses) {
         // Procesar actualizaciones de estado
