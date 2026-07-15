@@ -1531,7 +1531,9 @@ export class BaileysStartupService extends ChannelStartupService {
               (received.key.fromMe === false && mediaFileLength !== undefined && mediaFileLength > TEN_MB));
 
           if (skipMediaDownload) {
-            const caption = mediaNode?.caption;
+            // audioMessage/stickerMessage have no caption field; cast avoids TS2339 on the union
+            // and yields undefined for those types.
+            const caption = (mediaNode as any)?.caption;
             messageRaw.message = { conversation: '[file_sent]' + (caption ? ` ${caption}` : '') };
             messageRaw.messageType = 'conversation';
             this.logger.warn(
