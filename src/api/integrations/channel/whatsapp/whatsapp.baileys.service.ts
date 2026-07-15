@@ -1500,6 +1500,45 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const isVideo = received?.message?.videoMessage;
 
+          // Large / outgoing media guard (Baileys inbound path only): skip decryption/download
+          // and forward a plain text placeholder instead of the binary. Triggers for:
+          //   (1) key.fromMe === true  -> echo of media the client sent from their own device
+          //   (2) key.fromMe === false AND fileLength > 10MB -> oversized inbound media
+          // fromMe:false media with unknown or <=10MB size is left untouched (downloads as today).
+          // Reshaping messageRaw BEFORE the Chatwoot call below also prevents Chatwoot's own
+          // independent re-download (chatwoot.service.ts getBase64FromMediaMessage), since
+          // body.message will no longer carry any media keys.
+          const TEN_MB = 10 * 1024 * 1024;
+          const mediaNode =
+            received?.message?.imageMessage ||
+            received?.message?.videoMessage ||
+            received?.message?.stickerMessage ||
+            received?.message?.documentMessage ||
+            received?.message?.documentWithCaptionMessage?.message?.documentMessage ||
+            received?.message?.ptvMessage ||
+            received?.message?.audioMessage;
+
+          let mediaFileLength: number | undefined;
+          const rawFileLength = mediaNode?.fileLength;
+          if (rawFileLength !== undefined && rawFileLength !== null) {
+            mediaFileLength = Long.isLong(rawFileLength) ? rawFileLength.toNumber() : Number(rawFileLength);
+            if (Number.isNaN(mediaFileLength)) mediaFileLength = undefined;
+          }
+
+          const skipMediaDownload =
+            !!isMedia &&
+            (received.key.fromMe === true ||
+              (received.key.fromMe === false && mediaFileLength !== undefined && mediaFileLength > TEN_MB));
+
+          if (skipMediaDownload) {
+            const caption = mediaNode?.caption;
+            messageRaw.message = { conversation: '[file_sent]' + (caption ? ` ${caption}` : '') };
+            messageRaw.messageType = 'conversation';
+            this.logger.warn(
+              `[MEDIA-SKIP] instance=${this.instance.name} fromMe=${received.key.fromMe} fileLength=${mediaFileLength ?? 'unknown'} — forwarding as text, media download skipped`,
+            );
+          }
+
           if (this.localSettings.readMessages && received.key.id !== 'status@broadcast') {
             await this.client.readMessages([received.key]);
           }
@@ -1526,7 +1565,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          if (this.configService.get<Openai>('OPENAI').ENABLED && received?.message?.audioMessage) {
+          if (this.configService.get<Openai>('OPENAI').ENABLED && received?.message?.audioMessage && !skipMediaDownload) {
             const openAiDefaultSettings = await this.prismaRepository.openaiSetting.findFirst({
               where: { instanceId: this.instanceId },
               include: { OpenaiCreds: true },
@@ -1569,7 +1608,7 @@ export class BaileysStartupService extends ChannelStartupService {
               this.logger.info(`Update readed messages duplicated ignored [avoid deadlock]: ${messageKey}`);
             }
 
-            if (isMedia) {
+            if (isMedia && !skipMediaDownload) {
               if (this.configService.get<S3>('S3').ENABLE) {
                 try {
                   if (isVideo && !this.configService.get<S3>('S3').SAVE_VIDEO) {
@@ -1627,7 +1666,7 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (this.localWebhook.enabled) {
-            if (isMedia && this.localWebhook.webhookBase64) {
+            if (isMedia && !skipMediaDownload && this.localWebhook.webhookBase64) {
               try {
                 const buffer = await downloadMediaMessage(
                   { key: received.key, message: received?.message },

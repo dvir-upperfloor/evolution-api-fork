@@ -37,27 +37,67 @@ export class MetaController extends ChannelController implements ChannelControll
       }
 
       data.entry?.forEach(async (entry: any) => {
-        const numberId = entry.changes[0].value.metadata.phone_number_id;
+        const field = entry.changes?.[0]?.field;
 
-        if (!numberId) {
-          this.logger.error('WebhookService -> receiveWebhookMeta -> numberId not found');
+        if (field === 'messages' || field === 'smb_message_echoes') {
+          const numberId = entry.changes[0].value.metadata.phone_number_id;
+
+          if (!numberId) {
+            this.logger.error('WebhookService -> receiveWebhookMeta -> numberId not found');
+            return {
+              status: 'success',
+            };
+          }
+
+          const instance = await this.prismaRepository.instance.findFirst({
+            where: { number: numberId },
+          });
+
+          if (!instance) {
+            this.logger.error('WebhookService -> receiveWebhookMeta -> instance not found');
+            return {
+              status: 'success',
+            };
+          }
+
+          await this.waMonitor.waInstances[instance.name].connectToWhatsapp(data);
+
           return {
             status: 'success',
           };
         }
 
-        const instance = await this.prismaRepository.instance.findFirst({
-          where: { number: numberId },
-        });
+        if (field === 'account_update') {
+          const wabaId = entry.id;
 
-        if (!instance) {
-          this.logger.error('WebhookService -> receiveWebhookMeta -> instance not found');
+          if (!wabaId) {
+            this.logger.error('WebhookService -> receiveWebhookMeta -> account_update missing entry.id (WABA ID)');
+            return {
+              status: 'success',
+            };
+          }
+
+          const instance = await this.prismaRepository.instance.findFirst({
+            where: { businessId: wabaId },
+          });
+
+          if (!instance) {
+            this.logger.error(`WebhookService -> receiveWebhookMeta -> instance not found for businessId ${wabaId}`);
+            return {
+              status: 'success',
+            };
+          }
+
+          await this.waMonitor.waInstances[instance.name].accountUpdateHandler(wabaId, entry.changes[0].value);
+
           return {
             status: 'success',
           };
         }
 
-        await this.waMonitor.waInstances[instance.name].connectToWhatsapp(data);
+        this.logger.warn(
+          `WebhookService -> receiveWebhookMeta -> unhandled field: ${field}, payload: ${JSON.stringify(entry)}`,
+        );
 
         return {
           status: 'success',

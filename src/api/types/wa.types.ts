@@ -36,6 +36,7 @@ export enum Events {
   MESSAGING_HISTORY_SET = 'messaging-history.set',
   REMOVE_INSTANCE = 'remove.instance',
   LOGOUT_INSTANCE = 'logout.instance',
+  ACCOUNT_UPDATE = 'account.update',
 }
 
 export declare namespace wa {

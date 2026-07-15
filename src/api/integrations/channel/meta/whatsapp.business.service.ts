@@ -75,6 +75,24 @@ export class BusinessStartupService extends ChannelStartupService {
     return message.document || message.image || message.audio || message.video;
   }
 
+  // BSUID-safe identifier resolution: Meta's `from`/`wa_id` fields are always bare digit
+  // strings when they carry a phone number. A BSUID has a non-digit country prefix
+  // (e.g. "IL.2344668476307138") and must never reach createJid()'s digit-stripping
+  // regex (src/utils/createJid.ts:59), which would corrupt it into a colliding, non-unique JID.
+  private resolveMetaJid(identifier?: string, bsuid?: string): string | null {
+    if (identifier && /^\d+$/.test(identifier)) {
+      return createJid(identifier);
+    }
+
+    const rawBsuid = bsuid || identifier;
+
+    if (rawBsuid) {
+      return `${rawBsuid}@lid`;
+    }
+
+    return null;
+  }
+
   private async post(message: any, params: string) {
     try {
       let urlServer = this.configService.get<WaBusiness>('WA_BUSINESS').URL;
@@ -134,13 +152,42 @@ export class BusinessStartupService extends ChannelStartupService {
       this.eventHandler(content);
 
       this.phoneNumber = content.messages
-        ? createJid(content.messages[0].from)
+        ? this.resolveMetaJid(content.messages[0].from, content.messages[0].from_user_id)
         : content.message_echoes
-          ? createJid(content.message_echoes[0].from)
-          : createJid(content.statuses[0]?.recipient_id);
+          ? this.resolveMetaJid(content.message_echoes[0].from, content.message_echoes[0].from_user_id)
+          : this.resolveMetaJid(content.statuses[0]?.recipient_id);
+
+      if (!this.phoneNumber) {
+        this.logger.warn(
+          'WebhookService -> connectToWhatsapp -> unable to resolve sender identifier (no phone or BSUID present)',
+        );
+      }
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
+    }
+  }
+
+  // Router only: normalizes an account_update webhook and forwards it via the existing
+  // webhook mechanism. Takes no operational action (no reconnect/disconnect logic here).
+  public async accountUpdateHandler(wabaId: string, value: any): Promise<void> {
+    try {
+      const payload = {
+        type: value?.event ?? 'UNKNOWN',
+        reason: value?.disconnection_info?.reason ?? null,
+        initiated_by: value?.disconnection_info?.initiated_by ?? null,
+        waba_id: wabaId,
+        raw: value,
+      };
+
+      this.logger.warn(
+        `[ACCOUNT-UPDATE] instance=${this.instance.name} waba_id=${wabaId} type=${payload.type} reason=${payload.reason}`,
+      );
+
+      await this.sendDataWebhook(Events.ACCOUNT_UPDATE, payload);
+    } catch (error) {
+      this.logger.error('Error in accountUpdateHandler:');
+      this.logger.error(error);
     }
   }
 
@@ -688,6 +735,16 @@ export class BusinessStartupService extends ChannelStartupService {
           };
         }
 
+        // Capture BSUID (Business-Scoped User ID) when Meta sends it, alongside the
+        // phone-based remoteJid already set on `key` above — never replacing it.
+        const bsuid = message.from_user_id || received.contacts?.[0]?.user_id;
+        if (bsuid) {
+          messageRaw.contextInfo = {
+            ...(messageRaw.contextInfo || {}),
+            bsuid,
+          };
+        }
+
         this.logger.log(messageRaw);
 
         sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
@@ -927,7 +984,7 @@ export class BusinessStartupService extends ChannelStartupService {
 
       const key = {
         id: message.id,
-        remoteJid: createJid(message.to),
+        remoteJid: this.resolveMetaJid(message.to),
         fromMe: true as boolean,
       };
 
@@ -1062,6 +1119,8 @@ export class BusinessStartupService extends ChannelStartupService {
             .catch((err) => {
               this.logger.error(`[UNSUPPORTED-N8N-FAILED] ${err?.message}`);
             });
+
+          this.forwardUnsupportedMessage(content, message);
         }
       } else if (content.statuses) {
         // Procesar actualizaciones de estado
@@ -1073,6 +1132,52 @@ export class BusinessStartupService extends ChannelStartupService {
       }
     } catch (error) {
       this.logger.error('Error en eventHandler:');
+      this.logger.error(error);
+    }
+  }
+
+  // Forwards an "unsupported"-type Meta message (empty envelope, no content) as a normal
+  // messages.upsert event so downstream automation can act on it. Calls sendDataWebhook()
+  // directly — NOT messageHandle() — so Chatwoot (only ever invoked from inside
+  // messageHandle/messageHandleEcho) is never reached for these. Not persisted to the
+  // Message table (see report). Byte-for-byte separate from the normal message path below.
+  private async forwardUnsupportedMessage(content: any, message: any) {
+    try {
+      const reasonByCode: Record<number, string> = {
+        131060: 'MESSAGE_UNAVAILABLE',
+        131051: 'MESSAGE_TYPE_UNKNOWN',
+      };
+
+      const error = message.errors?.[0];
+      const errorCode = error?.code ?? null;
+      const bsuid = message.from_user_id || content.contacts?.[0]?.user_id;
+
+      const messageRaw: any = {
+        key: {
+          id: message.id,
+          remoteJid: this.resolveMetaJid(message.from, message.from_user_id),
+          fromMe: false,
+        },
+        pushName: content.contacts?.[0]?.profile?.name || null,
+        message: { conversation: '' },
+        messageType: 'unsupported',
+        messageTimestamp: parseInt(message.timestamp),
+        unsupported: {
+          errorCode,
+          reason: errorCode !== null ? (reasonByCode[errorCode] ?? 'UNKNOWN') : 'UNKNOWN',
+          title: error?.title ?? null,
+        },
+        source: 'unknown',
+        instanceId: this.instanceId,
+      };
+
+      if (bsuid) {
+        messageRaw.contextInfo = { bsuid };
+      }
+
+      await this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
+    } catch (error) {
+      this.logger.error('Error in forwardUnsupportedMessage:');
       this.logger.error(error);
     }
   }

@@ -86,6 +86,7 @@ export const instanceSchema: JSONSchema7 = {
           'CALL',
           'TYPEBOT_START',
           'TYPEBOT_CHANGE_STATUS',
+          'ACCOUNT_UPDATE',
         ],
       },
     },
