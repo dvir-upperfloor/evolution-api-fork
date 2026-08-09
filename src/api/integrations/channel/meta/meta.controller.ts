@@ -95,6 +95,106 @@ export class MetaController extends ChannelController implements ChannelControll
           };
         }
 
+        if (field === 'phone_number_quality_update') {
+          const numberId = entry.changes[0].value?.phone_number_id;
+
+          if (!numberId) {
+            this.logger.error(
+              'WebhookService -> receiveWebhookMeta -> phone_number_quality_update missing phone_number_id',
+            );
+            return {
+              status: 'success',
+            };
+          }
+
+          const instance = await this.prismaRepository.instance.findFirst({
+            where: { number: numberId },
+          });
+
+          if (!instance) {
+            this.logger.warn(
+              `WebhookService -> receiveWebhookMeta -> instance not found for phone_number_id ${numberId} (field=phone_number_quality_update)`,
+            );
+            return {
+              status: 'success',
+            };
+          }
+
+          await this.waMonitor.waInstances[instance.name].phoneNumberQualityUpdateHandler(
+            entry.id,
+            entry.changes[0].value,
+          );
+
+          return {
+            status: 'success',
+          };
+        }
+
+        if (field === 'account_alerts') {
+          const wabaId = entry.id;
+
+          if (!wabaId) {
+            this.logger.error('WebhookService -> receiveWebhookMeta -> account_alerts missing entry.id (WABA ID)');
+            return {
+              status: 'success',
+            };
+          }
+
+          const instance = await this.prismaRepository.instance.findFirst({
+            where: { businessId: wabaId },
+          });
+
+          if (!instance) {
+            this.logger.warn(
+              `WebhookService -> receiveWebhookMeta -> instance not found for businessId ${wabaId} (field=account_alerts)`,
+            );
+            return {
+              status: 'success',
+            };
+          }
+
+          await this.waMonitor.waInstances[instance.name].accountAlertsHandler(wabaId, entry.changes[0].value);
+
+          return {
+            status: 'success',
+          };
+        }
+
+        if (field === 'message_template_quality_update') {
+          const wabaId = entry.id;
+
+          if (!wabaId) {
+            this.logger.error(
+              'WebhookService -> receiveWebhookMeta -> message_template_quality_update missing entry.id (WABA ID)',
+            );
+            return {
+              status: 'success',
+            };
+          }
+
+          const instance = await this.prismaRepository.instance.findFirst({
+            where: { businessId: wabaId },
+          });
+
+          if (!instance) {
+            this.logger.warn(
+              `WebhookService -> receiveWebhookMeta -> instance not found for businessId ${wabaId} (field=message_template_quality_update)`,
+            );
+            return {
+              status: 'success',
+            };
+          }
+
+          await this.waMonitor.waInstances[instance.name].messageTemplateQualityUpdateHandler(
+            wabaId,
+            entry.changes[0].value,
+          );
+
+          return {
+            status: 'success',
+          };
+        }
+
         this.logger.warn(
           `WebhookService -> receiveWebhookMeta -> unhandled field: ${field}, payload: ${JSON.stringify(entry)}`,
         );

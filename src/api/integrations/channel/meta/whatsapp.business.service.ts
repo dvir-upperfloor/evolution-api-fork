@@ -191,6 +191,76 @@ export class BusinessStartupService extends ChannelStartupService {
     }
   }
 
+  // Router only: normalizes a phone_number_quality_update webhook and forwards it via the
+  // existing webhook mechanism. Takes no operational action.
+  public async phoneNumberQualityUpdateHandler(wabaId: string, value: any): Promise<void> {
+    try {
+      const payload = {
+        type: value?.event ?? 'UNKNOWN',
+        phone_number_id: value?.phone_number_id ?? null,
+        current_quality_rating: value?.current_quality_rating ?? null,
+        previous_quality_rating: value?.previous_quality_rating ?? null,
+        current_limit: value?.current_limit ?? null,
+        waba_id: wabaId,
+        raw: value,
+      };
+
+      this.logger.warn(
+        `[PHONE-NUMBER-QUALITY-UPDATE] instance=${this.instance.name} waba_id=${wabaId} phone_number_id=${payload.phone_number_id} rating=${payload.current_quality_rating}`,
+      );
+
+      await this.sendDataWebhook(Events.PHONE_NUMBER_QUALITY_UPDATE, payload);
+    } catch (error) {
+      this.logger.error('Error in phoneNumberQualityUpdateHandler:');
+      this.logger.error(error);
+    }
+  }
+
+  // Router only: normalizes an account_alerts webhook and forwards it via the existing
+  // webhook mechanism. Takes no operational action.
+  public async accountAlertsHandler(wabaId: string, value: any): Promise<void> {
+    try {
+      const payload = {
+        alert_type: value?.alert_type ?? null,
+        alert_severity: value?.alert_severity ?? null,
+        alert_description: value?.alert_description ?? null,
+        waba_id: wabaId,
+        raw: value,
+      };
+
+      this.logger.warn(
+        `[ACCOUNT-ALERTS] instance=${this.instance.name} waba_id=${wabaId} type=${payload.alert_type} severity=${payload.alert_severity}`,
+      );
+
+      await this.sendDataWebhook(Events.ACCOUNT_ALERTS, payload);
+    } catch (error) {
+      this.logger.error('Error in accountAlertsHandler:');
+      this.logger.error(error);
+    }
+  }
+
+  // Router only: normalizes a message_template_quality_update webhook and forwards it via
+  // the existing webhook mechanism. Payload shape not fully verified against Meta docs —
+  // raw carries the full value object; only message_template_id is extracted.
+  public async messageTemplateQualityUpdateHandler(wabaId: string, value: any): Promise<void> {
+    try {
+      const payload = {
+        message_template_id: value?.message_template_id ?? null,
+        waba_id: wabaId,
+        raw: value,
+      };
+
+      this.logger.warn(
+        `[MESSAGE-TEMPLATE-QUALITY-UPDATE] instance=${this.instance.name} waba_id=${wabaId} template_id=${payload.message_template_id}`,
+      );
+
+      await this.sendDataWebhook(Events.MESSAGE_TEMPLATE_QUALITY_UPDATE, payload);
+    } catch (error) {
+      this.logger.error('Error in messageTemplateQualityUpdateHandler:');
+      this.logger.error(error);
+    }
+  }
+
   private async downloadMediaMessage(message: any) {
     try {
       const id = message[message.type].id;

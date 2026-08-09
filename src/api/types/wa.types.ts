@@ -37,6 +37,9 @@ export enum Events {
   REMOVE_INSTANCE = 'remove.instance',
   LOGOUT_INSTANCE = 'logout.instance',
   ACCOUNT_UPDATE = 'account.update',
+  PHONE_NUMBER_QUALITY_UPDATE = 'phone-number-quality.update',
+  ACCOUNT_ALERTS = 'account.alerts',
+  MESSAGE_TEMPLATE_QUALITY_UPDATE = 'message-template-quality.update',
 }
 
 export declare namespace wa {
