@@ -155,7 +155,7 @@ export class BusinessStartupService extends ChannelStartupService {
         ? this.resolveMetaJid(content.messages[0].from, content.messages[0].from_user_id)
         : content.message_echoes
           ? this.resolveMetaJid(content.message_echoes[0].from, content.message_echoes[0].from_user_id)
-          : this.resolveMetaJid(content.statuses[0]?.recipient_id);
+          : this.resolveMetaJid(content.statuses?.[0]?.recipient_id);
 
       if (!this.phoneNumber) {
         this.logger.warn(
@@ -184,7 +184,14 @@ export class BusinessStartupService extends ChannelStartupService {
         `[ACCOUNT-UPDATE] instance=${this.instance.name} waba_id=${wabaId} type=${payload.type} reason=${payload.reason}`,
       );
 
-      await this.sendDataWebhook(Events.ACCOUNT_UPDATE, payload);
+      // Fire-and-forget. sendDataWebhook fans out to all transports in series, and the
+      // webhook transport retries up to 10 times at 30s with backoff to 300s. The router
+      // awaits this handler inside its per-change loop, so awaiting here would head-of-line
+      // block every remaining change in the batch for up to ~25 minutes. Matches the
+      // un-awaited pattern used by every other sendDataWebhook call site in this file.
+      this.sendDataWebhook(Events.ACCOUNT_UPDATE, payload).catch((error) => {
+        this.logger.error(`[ACCOUNT-UPDATE] webhook dispatch failed: ${error?.message ?? error}`);
+      });
     } catch (error) {
       this.logger.error('Error in accountUpdateHandler:');
       this.logger.error(error);
@@ -209,7 +216,10 @@ export class BusinessStartupService extends ChannelStartupService {
         `[PHONE-NUMBER-QUALITY-UPDATE] instance=${this.instance.name} waba_id=${wabaId} phone_number_id=${payload.phone_number_id} rating=${payload.current_quality_rating}`,
       );
 
-      await this.sendDataWebhook(Events.PHONE_NUMBER_QUALITY_UPDATE, payload);
+      // Fire-and-forget: awaiting would head-of-line block the rest of the batch (see above).
+      this.sendDataWebhook(Events.PHONE_NUMBER_QUALITY_UPDATE, payload).catch((error) => {
+        this.logger.error(`[PHONE-NUMBER-QUALITY-UPDATE] webhook dispatch failed: ${error?.message ?? error}`);
+      });
     } catch (error) {
       this.logger.error('Error in phoneNumberQualityUpdateHandler:');
       this.logger.error(error);
@@ -232,7 +242,10 @@ export class BusinessStartupService extends ChannelStartupService {
         `[ACCOUNT-ALERTS] instance=${this.instance.name} waba_id=${wabaId} type=${payload.alert_type} severity=${payload.alert_severity}`,
       );
 
-      await this.sendDataWebhook(Events.ACCOUNT_ALERTS, payload);
+      // Fire-and-forget: awaiting would head-of-line block the rest of the batch (see above).
+      this.sendDataWebhook(Events.ACCOUNT_ALERTS, payload).catch((error) => {
+        this.logger.error(`[ACCOUNT-ALERTS] webhook dispatch failed: ${error?.message ?? error}`);
+      });
     } catch (error) {
       this.logger.error('Error in accountAlertsHandler:');
       this.logger.error(error);
@@ -254,7 +267,10 @@ export class BusinessStartupService extends ChannelStartupService {
         `[MESSAGE-TEMPLATE-QUALITY-UPDATE] instance=${this.instance.name} waba_id=${wabaId} template_id=${payload.message_template_id}`,
       );
 
-      await this.sendDataWebhook(Events.MESSAGE_TEMPLATE_QUALITY_UPDATE, payload);
+      // Fire-and-forget: awaiting would head-of-line block the rest of the batch (see above).
+      this.sendDataWebhook(Events.MESSAGE_TEMPLATE_QUALITY_UPDATE, payload).catch((error) => {
+        this.logger.error(`[MESSAGE-TEMPLATE-QUALITY-UPDATE] webhook dispatch failed: ${error?.message ?? error}`);
+      });
     } catch (error) {
       this.logger.error('Error in messageTemplateQualityUpdateHandler:');
       this.logger.error(error);
@@ -896,76 +912,114 @@ export class BusinessStartupService extends ChannelStartupService {
       }
       if (received.statuses) {
         for await (const item of received.statuses) {
-          const key = {
-            id: item.id,
-            remoteJid: this.phoneNumber,
-            fromMe: this.phoneNumber === received.metadata.phone_number_id,
-          };
-          if (settings?.groups_ignore && key.remoteJid.includes('@g.us')) {
-            return;
-          }
-          if (key.remoteJid !== 'status@broadcast' && !key?.remoteJid?.match(/(:\d+)/)) {
-            const findMessage = await this.prismaRepository.message.findFirst({
-              where: {
-                instanceId: this.instanceId,
-                key: {
-                  path: ['id'],
-                  equals: key.id,
-                },
-              },
-            });
-
-            if (!findMessage) {
-              return;
+          // Per-item error boundary: a rejected await (prisma, or the axios.post below to a
+          // customer-supplied webhookUrl) would otherwise unwind the whole for-await loop
+          // and discard every remaining status in the batch.
+          try {
+            // Derive the JID from THIS item. this.phoneNumber is resolved once per webhook
+            // from statuses[0].recipient_id, so stamping it on every item mislabels items
+            // 2..N of a multi-recipient batch. Falling back to this.phoneNumber keeps
+            // single-status batches byte-for-byte identical to before.
+            const key = {
+              id: item.id,
+              remoteJid: this.resolveMetaJid(item.recipient_id) ?? this.phoneNumber,
+              fromMe: this.phoneNumber === received.metadata.phone_number_id,
+            };
+            if (settings?.groups_ignore && key.remoteJid.includes('@g.us')) {
+              continue;
             }
+            if (key.remoteJid !== 'status@broadcast' && !key?.remoteJid?.match(/(:\d+)/)) {
+              const findMessage = await this.prismaRepository.message.findFirst({
+                where: {
+                  instanceId: this.instanceId,
+                  key: {
+                    path: ['id'],
+                    equals: key.id,
+                  },
+                },
+              });
 
-            if (item.message === null && item.status === undefined) {
-              this.sendDataWebhook(Events.MESSAGES_DELETE, key);
+              // The message may have been sent outside Evolution (e.g. a template fired
+              // straight at the Graph API), so it has no row in our Message table. The
+              // status is still meaningful to consumers that track by wamid, so we keep
+              // emitting the webhook and only skip persistence: MessageUpdate.messageId
+              // is a required FK to Message and would throw for an unknown wamid.
+              if (!findMessage) {
+                this.logger.warn(
+                  `[STATUS-UNKNOWN-MSG] instance=${this.instance.name} wamid=${key.id} status=${item.status ?? 'none'}`,
+                );
+              }
+
+              if (item.message === null && item.status === undefined) {
+                // Unknown wamid: keep the previous behaviour and skip entirely, so we never
+                // emit a delete for - or ask Chatwoot to delete - a message we never stored.
+                if (!findMessage) {
+                  continue;
+                }
+
+                this.sendDataWebhook(Events.MESSAGES_DELETE, key);
+
+                const message: any = {
+                  messageId: findMessage.id,
+                  keyId: key.id,
+                  remoteJid: key.remoteJid,
+                  fromMe: key.fromMe,
+                  participant: key?.remoteJid,
+                  status: 'DELETED',
+                  instanceId: this.instanceId,
+                };
+
+                await this.prismaRepository.messageUpdate.create({
+                  data: message,
+                });
+
+                if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+                  this.chatwootService.eventWhatsapp(
+                    Events.MESSAGES_DELETE,
+                    { instanceName: this.instance.name, instanceId: this.instanceId },
+                    { key: key },
+                  );
+                }
+
+                continue;
+              }
+
+              // No status field means there is no update to report, and toUpperCase() would
+              // throw here and take the rest of the batch with it.
+              if (!item.status) {
+                this.logger.warn(
+                  `[STATUS-MISSING] instance=${this.instance.name} wamid=${key.id} - no status field, skipping`,
+                );
+                continue;
+              }
 
               const message: any = {
-                messageId: findMessage.id,
+                messageId: findMessage?.id ?? null,
                 keyId: key.id,
                 remoteJid: key.remoteJid,
                 fromMe: key.fromMe,
                 participant: key?.remoteJid,
-                status: 'DELETED',
+                status: item.status?.toUpperCase(),
                 instanceId: this.instanceId,
               };
 
-              await this.prismaRepository.messageUpdate.create({
-                data: message,
-              });
+              this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
 
-              if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-                this.chatwootService.eventWhatsapp(
-                  Events.MESSAGES_DELETE,
-                  { instanceName: this.instance.name, instanceId: this.instanceId },
-                  { key: key },
-                );
+              if (findMessage) {
+                await this.prismaRepository.messageUpdate.create({
+                  data: message,
+                });
               }
 
-              return;
+              if (findMessage?.webhookUrl) {
+                await axios.post(findMessage.webhookUrl, message, { timeout: 30000 });
+              }
             }
-
-            const message: any = {
-              messageId: findMessage.id,
-              keyId: key.id,
-              remoteJid: key.remoteJid,
-              fromMe: key.fromMe,
-              participant: key?.remoteJid,
-              status: item.status.toUpperCase(),
-              instanceId: this.instanceId,
-            };
-
-            this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
-
-            await this.prismaRepository.messageUpdate.create({
-              data: message,
-            });
-
-            if (findMessage.webhookUrl) {
-              await axios.post(findMessage.webhookUrl, message);
-            }
+          } catch (error) {
+            this.logger.error(
+              `[STATUS-ITEM-ERROR] instance=${this.instance.name} wamid=${item?.id} error=${error?.message ?? error}`,
+            );
+            continue;
           }
         }
       }
@@ -1180,12 +1234,16 @@ export class BusinessStartupService extends ChannelStartupService {
           this.logger.warn(`[UNSUPPORTED-RAW] instance=${this.instance.name} content=${JSON.stringify(content)}`);
 
           axios
-            .post('https://n8n.upperfloor.ai/webhook/error-logs-workflow', {
-              type: 'unsupported_webhook',
-              instance: this.instance.name,
-              timestamp: new Date().toISOString(),
-              payload: content,
-            })
+            .post(
+              'https://n8n.upperfloor.ai/webhook/error-logs-workflow',
+              {
+                type: 'unsupported_webhook',
+                instance: this.instance.name,
+                timestamp: new Date().toISOString(),
+                payload: content,
+              },
+              { timeout: 30000 },
+            )
             .catch((err) => {
               this.logger.error(`[UNSUPPORTED-N8N-FAILED] ${err?.message}`);
             });
