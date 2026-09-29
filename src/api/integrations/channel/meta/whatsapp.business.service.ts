@@ -524,11 +524,10 @@ export class BusinessStartupService extends ChannelStartupService {
       let messageRaw: any;
       let pushName: any;
 
-      if (received.contacts) pushName = received.contacts[0].profile.name;
+      if (received.contacts) pushName = received.contacts[0]?.profile?.name;
 
       if (received.messages) {
         const message = received.messages[0]; // Añadir esta línea para definir message
-        this.logger.error(`[CTWA-DEBUG] Raw Meta message from ${message.from}: type=${message.type}, keys=[${Object.keys(message).join(',')}], referral=${JSON.stringify(message.referral || 'NONE')}, context=${JSON.stringify(message.context || 'NONE')}`);
 
         const key = {
           id: message.id,
@@ -1203,7 +1202,6 @@ export class BusinessStartupService extends ChannelStartupService {
       // Registro para depuración
       this.logger.log('Contenido recibido en eventHandler:');
       this.logger.log(JSON.stringify(content, null, 2));
-      this.logger.error(`[CTWA-DEBUG-RAW] Full Meta payload messages[0] keys: ${JSON.stringify(Object.keys(content?.messages?.[0] || {}))}, has referral: ${!!content?.messages?.[0]?.referral}, has context: ${!!content?.messages?.[0]?.context}`);
 
       const database = this.configService.get<Database>('DATABASE');
       const settings = await this.findSettings();
