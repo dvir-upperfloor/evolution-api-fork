@@ -921,8 +921,9 @@ export class BusinessStartupService extends ChannelStartupService {
             // single-status batches byte-for-byte identical to before.
             const key = {
               id: item.id,
-              remoteJid: this.resolveMetaJid(item.recipient_id) ?? this.phoneNumber,
-              fromMe: this.phoneNumber === received.metadata.phone_number_id,
+              remoteJid: this.resolveMetaJid(item.recipient_id, item.recipient_user_id) ?? this.phoneNumber,
+              // Meta sends status webhooks only for messages the business sent.
+              fromMe: true,
             };
             if (settings?.groups_ignore && key.remoteJid.includes('@g.us')) {
               continue;
@@ -1002,7 +1003,10 @@ export class BusinessStartupService extends ChannelStartupService {
                 instanceId: this.instanceId,
               };
 
-              this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
+              this.sendDataWebhook(
+                Events.MESSAGES_UPDATE,
+                Array.isArray(item.errors) && item.errors.length ? { ...message, errors: item.errors } : message,
+              );
 
               if (findMessage) {
                 await this.prismaRepository.messageUpdate.create({
