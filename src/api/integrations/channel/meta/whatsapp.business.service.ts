@@ -531,7 +531,8 @@ export class BusinessStartupService extends ChannelStartupService {
 
         const key = {
           id: message.id,
-          remoteJid: this.phoneNumber,
+          // Sender from THIS message, not shared instance state (race across concurrent webhooks).
+          remoteJid: this.resolveMetaJid(message.from, message.from_user_id),
           fromMe: message.from === received.metadata.phone_number_id,
         };
 
